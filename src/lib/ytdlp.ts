@@ -30,10 +30,15 @@ export interface DownloadOptions {
   isPlaylist: boolean;
 }
 
+/** Fase atual do download, emitida pelo backend. */
+export type DownloadPhase = "preparing" | "downloading" | "converting";
+
 export interface ProgressPayload {
+  /** Progresso geral 0-100, ja remapeado entre as faixas e monotonico. */
   percent: number;
   speed: string;
   eta: string;
+  phase: DownloadPhase;
   itemIndex: number | null;
   itemTotal: number | null;
 }

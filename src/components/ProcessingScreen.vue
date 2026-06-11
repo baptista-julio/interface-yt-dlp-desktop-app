@@ -25,9 +25,12 @@ const emit = defineEmits<{
   canceled: [];
 }>();
 
+import type { DownloadPhase } from "../lib/ytdlp";
+
 const percent = ref(0);
 const speed = ref("");
 const eta = ref("");
+const phase = ref<DownloadPhase>("preparing");
 const itemIndex = ref<number | null>(null);
 const itemTotal = ref<number | null>(null);
 const canceling = ref(false);
@@ -38,11 +41,22 @@ const isPlaylistRun = computed(
   () => props.options.isPlaylist && (itemTotal.value ?? 0) > 1,
 );
 
+// Enquanto o yt-dlp resolve os metadados do video (antes do 1o byte) nao ha
+// percentual: mostramos uma barra indeterminada em vez de um 0% travado.
+const isIndeterminate = computed(
+  () => phase.value === "preparing" && !canceling.value,
+);
+
 const statusText = computed(() => {
   if (canceling.value) return "Cancelando...";
-  if (percent.value >= 100) return "Finalizando (convertendo)...";
-  if (percent.value > 0) return "Baixando...";
-  return "Preparando...";
+  switch (phase.value) {
+    case "preparing":
+      return "Obtendo informacoes do video...";
+    case "converting":
+      return "Finalizando (convertendo)...";
+    default:
+      return "Baixando...";
+  }
 });
 
 async function cancel() {
@@ -58,9 +72,12 @@ async function cancel() {
 onMounted(async () => {
   unlisteners.push(
     await onProgress((p) => {
+      // O backend ja entrega o percentual remapeado entre as faixas; ao trocar
+      // de item da playlist ele reinicia (volta a subir do 0), o que e correto.
       percent.value = p.percent;
       speed.value = p.speed;
       eta.value = p.eta;
+      phase.value = p.phase;
       itemIndex.value = p.itemIndex;
       itemTotal.value = p.itemTotal;
     }),
@@ -92,12 +109,22 @@ onBeforeUnmount(() => {
   >
     <div class="progress-panel">
       <div class="progress-head">
-        <span class="progress-percent">{{ Math.round(percent) }}%</span>
+        <span class="progress-percent">
+          {{ isIndeterminate ? "—" : `${Math.round(percent)}%` }}
+        </span>
         <span class="progress-status">{{ statusText }}</span>
       </div>
 
-      <div class="progress-bar" role="progressbar" :aria-valuenow="Math.round(percent)">
-        <div class="progress-fill" :style="{ width: `${Math.min(percent, 100)}%` }" />
+      <div
+        class="progress-bar"
+        :class="{ indeterminate: isIndeterminate }"
+        role="progressbar"
+        :aria-valuenow="isIndeterminate ? undefined : Math.round(percent)"
+      >
+        <div
+          class="progress-fill"
+          :style="isIndeterminate ? undefined : { width: `${Math.min(percent, 100)}%` }"
+        />
       </div>
 
       <div v-if="speed || eta || isPlaylistRun" class="progress-meta">
@@ -174,6 +201,23 @@ onBeforeUnmount(() => {
   background-color: var(--primary);
   border-radius: 5px;
   transition: width 0.3s ease-out;
+}
+
+/* Barra indeterminada: enquanto o yt-dlp resolve os metadados (sem %), um
+   bloco desliza da esquerda para a direita indicando atividade. */
+.progress-bar.indeterminate .progress-fill {
+  width: 35%;
+  transition: none;
+  animation: progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(330%);
+  }
 }
 
 .progress-meta {

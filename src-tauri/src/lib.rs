@@ -62,9 +62,14 @@ pub struct DownloadOptions {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProgressPayload {
+    /// Progresso GERAL de 0 a 100, ja remapeado entre as faixas (video+audio)
+    /// e monotonico (nunca diminui). Ver `DownloadProgress`.
     percent: f64,
     speed: String,
     eta: String,
+    /// Fase atual: "preparing" (obtendo metadados, sem %), "downloading"
+    /// (baixando faixas) ou "converting" (merge/extracao de audio).
+    phase: String,
     /// Indice do item atual numa playlist (1-based); None para video unico.
     item_index: Option<u32>,
     /// Total de itens numa playlist; None para video unico.
@@ -313,6 +318,9 @@ async fn start_download(
 
     let output_dir = options.output_dir.clone();
     let mut last_error = String::new();
+    // Rastreia as multiplas fases de um download (video, audio, conversao) e
+    // remapeia o progresso por-faixa do yt-dlp num progresso geral monotonico.
+    let mut progress = DownloadProgress::default();
 
     tauri::async_runtime::spawn(async move {
         let state = app.state::<DownloadState>();
@@ -322,10 +330,8 @@ async fn start_download(
                     let line = String::from_utf8_lossy(&bytes);
                     for raw in line.split('\n') {
                         let trimmed = raw.trim();
-                        if let Some(rest) = trimmed.strip_prefix(PROGRESS_PREFIX) {
-                            if let Some(payload) = parse_progress(rest) {
-                                let _ = app.emit("download://progress", payload);
-                            }
+                        if let Some(payload) = progress.observe(trimmed) {
+                            let _ = app.emit("download://progress", payload);
                         }
                     }
                 }
@@ -488,31 +494,122 @@ fn ffmpeg_path(_app: &AppHandle) -> Result<String, String> {
     Ok("ffmpeg".to_string())
 }
 
-/// Parse de uma linha de progresso (sem o prefixo).
-/// Formato: percent|speed|eta|playlist_index|n_entries
-fn parse_progress(rest: &str) -> Option<ProgressPayload> {
-    let parts: Vec<&str> = rest.split('|').collect();
-    if parts.is_empty() {
-        return None;
+/// Maquina de estados que remapeia o progresso do yt-dlp.
+///
+/// Um download de video sai do yt-dlp como 2 downloads separados (a faixa de
+/// video e a de audio), cada um indo de 0% a 100%, seguidos de um merge. Audio
+/// (mp3) e 1 download seguido de uma extracao. Se repassassemos o `_percent_str`
+/// cru, a barra "voltaria para o inicio" entre as faixas. Aqui mapeamos cada
+/// faixa numa fatia do total (com 2 faixas: video 0-50%, audio 50-100%) e
+/// garantimos que o valor nunca diminua (o download paralelo `-N` reporta
+/// fragmentos fora de ordem, gerando saltos para tras).
+#[derive(Default)]
+struct DownloadProgress {
+    /// Quantas faixas (formatos) o download tem. 0 = ainda nao sabido.
+    total_streams: u32,
+    /// Quantas faixas ja comecaram a baixar (via "[download] Destination:").
+    streams_started: u32,
+    /// True quando a etapa de pos-processamento (merge/extracao) comecou.
+    converting: bool,
+    /// Maior percentual geral ja reportado, para manter a barra monotonica.
+    overall_max: f64,
+    /// Ultimo indice/total de playlist visto, para rotular a fase de conversao.
+    last_item: Option<u32>,
+    last_item_total: Option<u32>,
+}
+
+impl DownloadProgress {
+    /// Processa uma linha de stdout do yt-dlp. Retorna um payload de progresso
+    /// quando a linha gera uma atualizacao para o frontend.
+    fn observe(&mut self, line: &str) -> Option<ProgressPayload> {
+        // 1) Numero de faixas: "[info] ...: Downloading 2 format(s): 398+140".
+        //    Contamos os formatos pelo '+' na parte apos "format(s):". Esta
+        //    linha tambem marca o inicio de cada item de uma playlist, entao
+        //    reiniciamos o tracking da faixa aqui (a barra representa o item
+        //    atual; o "Video X de Y" no rotulo cuida do total).
+        if line.starts_with("[info]") && line.contains("Downloading") && line.contains("format(s):")
+        {
+            if let Some(spec) = line.rsplit("format(s):").next() {
+                let count = spec.split('+').filter(|s| !s.trim().is_empty()).count() as u32;
+                self.total_streams = count.max(1);
+            }
+            self.streams_started = 0;
+            self.converting = false;
+            self.overall_max = 0.0;
+            return None;
+        }
+
+        // 2) Inicio de uma nova faixa de download.
+        if line.starts_with("[download] Destination:") {
+            self.streams_started = self.streams_started.saturating_add(1);
+            return None;
+        }
+
+        // 3) Pos-processamento: merge (video) ou extracao de audio (mp3).
+        if line.starts_with("[Merger]") || line.starts_with("[ExtractAudio]") {
+            if !self.converting {
+                self.converting = true;
+                self.overall_max = 100.0;
+                return Some(ProgressPayload {
+                    percent: 100.0,
+                    speed: String::new(),
+                    eta: String::new(),
+                    phase: "converting".into(),
+                    item_index: self.last_item,
+                    item_total: self.last_item_total,
+                });
+            }
+            return None;
+        }
+
+        // 4) Linha de progresso propriamente dita.
+        let rest = line.strip_prefix(PROGRESS_PREFIX)?;
+        self.parse_progress(rest)
     }
 
-    let percent = parts
-        .first()
-        .map(|s| parse_percent(s))
-        .unwrap_or(0.0);
+    /// Parse de uma linha de progresso (sem o prefixo) e remapeamento para o
+    /// progresso geral. Formato: percent|speed|eta|playlist_index|n_entries
+    fn parse_progress(&mut self, rest: &str) -> Option<ProgressPayload> {
+        let parts: Vec<&str> = rest.split('|').collect();
+        if parts.is_empty() {
+            return None;
+        }
 
-    let speed = clean_na(parts.get(1).copied().unwrap_or(""));
-    let eta = clean_na(parts.get(2).copied().unwrap_or(""));
-    let item_index = parts.get(3).and_then(|s| parse_uint(s));
-    let item_total = parts.get(4).and_then(|s| parse_uint(s));
+        let stream_percent = parts.first().map(|s| parse_percent(s)).unwrap_or(0.0);
+        let speed = clean_na(parts.get(1).copied().unwrap_or(""));
+        let eta = clean_na(parts.get(2).copied().unwrap_or(""));
+        let item_index = parts.get(3).and_then(|s| parse_uint(s));
+        let item_total = parts.get(4).and_then(|s| parse_uint(s));
+        self.last_item = item_index;
+        self.last_item_total = item_total;
 
-    Some(ProgressPayload {
-        percent,
-        speed,
-        eta,
-        item_index,
-        item_total,
-    })
+        // Se a primeira faixa ainda nao foi contada (a linha "Destination:"
+        // pode nao ter aparecido em alguns formatos), assume que estamos nela.
+        if self.streams_started == 0 {
+            self.streams_started = 1;
+        }
+
+        // Remapeia o percentual da faixa atual para a fatia dela no total.
+        // streams_started e 1-based; a faixa atual e a de indice (started - 1).
+        let total = self.total_streams.max(1);
+        let current = self.streams_started.saturating_sub(1).min(total - 1);
+        let slice = 100.0 / total as f64;
+        let overall = current as f64 * slice + stream_percent.clamp(0.0, 100.0) / 100.0 * slice;
+
+        // Mantem monotonico: ignora regressoes do download paralelo.
+        if overall > self.overall_max {
+            self.overall_max = overall;
+        }
+
+        Some(ProgressPayload {
+            percent: self.overall_max,
+            speed,
+            eta,
+            phase: "downloading".into(),
+            item_index,
+            item_total,
+        })
+    }
 }
 
 fn parse_percent(s: &str) -> f64 {
@@ -580,4 +677,107 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ---------------------------------------------------------------------------
+// Testes do remapeamento de progresso
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Roda uma sequencia de linhas de stdout e devolve os percentuais/fases
+    /// emitidos ao frontend.
+    fn run(lines: &[&str]) -> Vec<(f64, String)> {
+        let mut p = DownloadProgress::default();
+        lines
+            .iter()
+            .filter_map(|l| p.observe(l))
+            .map(|payload| (payload.percent, payload.phase))
+            .collect()
+    }
+
+    #[test]
+    fn video_two_streams_never_rewinds_and_maps_to_halves() {
+        // Saida real (resumida) de um download de video: 2 faixas + merge.
+        let out = run(&[
+            "[info] uedJx6hkKS0: Downloading 1 format(s): 398+140",
+            "[download] Destination: ...f398.mp4",
+            "YTDLPROG| 28.1%|  19.23MiB/s|00:00|NA|NA",
+            "YTDLPROG| 56.2%|  17.16MiB/s|00:00|NA|NA",
+            "YTDLPROG|100.0%|  14.14MiB/s|00:00|NA|NA",
+            "[download] Destination: ...f140.m4a",
+            "YTDLPROG|  0.0%| 186.44KiB/s|00:13|NA|NA",
+            "YTDLPROG| 39.6%|  15.02MiB/s|00:00|NA|NA",
+            "YTDLPROG|100.0%|  12.95MiB/s|00:00|NA|NA",
+            "[Merger] Merging formats into \"...mp4\"",
+        ]);
+
+        let percents: Vec<f64> = out.iter().map(|(p, _)| *p).collect();
+        // Faixa de video (50% do total): 28% -> 14, 56% -> 28, 100% -> 50.
+        // Faixa de audio (50% restante): 0% -> 50, 40% -> ~70, 100% -> 100.
+        assert!((percents[0] - 14.05).abs() < 0.5, "{:?}", percents);
+        assert!((percents[2] - 50.0).abs() < 0.01, "{:?}", percents);
+        assert!((percents[3] - 50.0).abs() < 0.01, "audio comeca em 50% {:?}", percents);
+        assert!((percents[5] - 100.0).abs() < 0.01, "{:?}", percents);
+
+        // Monotonico: nunca diminui ao longo de todo o download.
+        for w in percents.windows(2) {
+            assert!(w[1] >= w[0], "regrediu: {:?}", percents);
+        }
+        // Termina na fase de conversao em 100%.
+        assert_eq!(out.last().unwrap().1, "converting");
+    }
+
+    #[test]
+    fn parallel_fragment_jitter_is_clamped_monotonic() {
+        // O download paralelo (-N 4) reporta percentuais fora de ordem.
+        let out = run(&[
+            "[info] x: Downloading 1 format(s): 398+140",
+            "[download] Destination: ...f398.mp4",
+            "YTDLPROG| 69.3%|  16.64MiB/s|00:00|NA|NA",
+            "YTDLPROG| 69.3%| Unknown B/s|Unknown|NA|NA",
+            "YTDLPROG| 70.2%|  46.50MiB/s|00:00|NA|NA",
+            "YTDLPROG| 71.1%|   4.39MiB/s|00:00|NA|NA",
+        ]);
+        let percents: Vec<f64> = out.iter().map(|(p, _)| *p).collect();
+        for w in percents.windows(2) {
+            assert!(w[1] >= w[0], "regrediu: {:?}", percents);
+        }
+    }
+
+    #[test]
+    fn audio_single_stream_uses_full_bar() {
+        let out = run(&[
+            "[info] x: Downloading 1 format(s): 251",
+            "[download] Destination: ...webm",
+            "YTDLPROG| 51.6%|   8.47MiB/s|00:00|NA|NA",
+            "YTDLPROG|100.0%|  11.62MiB/s|00:00|NA|NA",
+            "[ExtractAudio] Destination: ...mp3",
+        ]);
+        // Uma so faixa => o percentual da faixa e o percentual geral.
+        assert!((out[0].0 - 51.6).abs() < 0.01, "{:?}", out);
+        assert!((out[1].0 - 100.0).abs() < 0.01, "{:?}", out);
+        assert_eq!(out.last().unwrap().1, "converting");
+    }
+
+    #[test]
+    fn playlist_resets_per_item() {
+        let out = run(&[
+            "[info] a: Downloading 1 format(s): 398+140",
+            "[download] Destination: ...a.f398.mp4",
+            "YTDLPROG|100.0%|  9MiB/s|00:00|1|3",
+            "[download] Destination: ...a.f140.m4a",
+            "YTDLPROG|100.0%|  9MiB/s|00:00|1|3",
+            "[Merger] Merging into a.mp4",
+            // Item 2: novo [info] reinicia o tracking; a barra volta a subir.
+            "[info] b: Downloading 1 format(s): 398+140",
+            "[download] Destination: ...b.f398.mp4",
+            "YTDLPROG| 10.0%|  9MiB/s|00:00|2|3",
+        ]);
+        // O ultimo evento e o item 2 com a barra de volta a um valor baixo.
+        let (last_pct, _) = out.last().unwrap();
+        assert!(*last_pct < 20.0, "item 2 deveria reiniciar baixo: {:?}", out);
+    }
 }
